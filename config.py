@@ -33,12 +33,23 @@ LLM_API_KEY = (
 
 # --- LLM Settings ---
 
+# Primary LLM Model
 # Examples:
-# "gemini"
+# "gemini/gemini-2.5-flash-lite"
+# "gemini/gemini-3.1-flash-lite-preview"
 # "gpt-4o-mini"
 # "groq/llama-3.3-70b-versatile"
 
-LLM_MODEL = "gpt-4o-mini"
+LLM_MODEL = "gemini/gemini-2.5-flash-lite"
+
+# LLM Fallback Models (in priority order)
+# If the primary model fails or hits rate limits, the client will automatically
+# attempt these fallback models in the specified order
+# Priority: Gemini (primary) → OpenAI → Groq
+LLM_FALLBACK_MODELS = [
+    "gpt-4o-mini",  # OpenAI fallback
+    "groq/llama-3.3-70b-versatile",  # Groq secondary fallback
+]
 
 # =================================================================
 # LINKEDIN SEARCH CONFIGURATION
