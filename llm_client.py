@@ -4,6 +4,11 @@ Universal LLM Client using LiteLLM.
 Provides a unified interface for 400+ LLMs with built-in rate limiting,
 exponential backoff, and daily budget tracking.
 
+Supports intelligent fallback across multiple LLM providers:
+1. Gemini (primary)
+2. OpenAI (fallback)
+3. Groq (secondary fallback)
+
 Usage:
     from llm_client import primary_client
 
@@ -20,7 +25,7 @@ import time
 import random
 import logging
 import threading
-from typing import Optional, Any, Type
+from typing import Optional, Any, Type, List
 
 import litellm
 from pydantic import BaseModel
@@ -65,10 +70,13 @@ class RateLimiter:
 
 class LLMClient:
     """
-    Universal LLM client powered by LiteLLM.
+    Universal LLM client powered by LiteLLM with intelligent fallback.
 
     Wraps litellm.completion() with rate limiting, exponential backoff,
-    and daily budget tracking.
+    daily budget tracking, and intelligent fallback across multiple providers:
+    - Primary: Gemini
+    - Fallback 1: OpenAI
+    - Fallback 2: Groq
     """
 
     def __init__(
@@ -80,18 +88,20 @@ class LLMClient:
         retry_base_delay: int = 10,
         daily_budget: int = 0,
         request_delay: float = 0,
+        fallback_models: Optional[List[str]] = None,
     ):
         """
         Initialize the LLM client.
 
         Args:
-            model: LiteLLM model string (e.g., "gemini/gemini-2.5-flash-lite")
+            model: Primary LiteLLM model string (e.g., "gemini/gemini-2.5-flash-lite")
             api_key: API key for the provider (auto-detected from env if not set)
             max_rpm: Maximum requests per minute
             max_retries: Max retries on rate-limit errors
             retry_base_delay: Base delay in seconds for exponential backoff
             daily_budget: Max requests per day (0 = unlimited)
             request_delay: Fixed delay between requests in seconds
+            fallback_models: List of fallback models in priority order
         """
         self.model = model
         self.api_key = api_key
@@ -100,6 +110,7 @@ class LLMClient:
         self.daily_budget = daily_budget
         self.request_delay = request_delay
         self.rate_limiter = RateLimiter(max_rpm)
+        self.fallback_models = fallback_models or []
 
         # Daily budget tracking
         self._daily_count = 0
@@ -143,6 +154,16 @@ class LLMClient:
                 f"Increase LLM_DAILY_REQUEST_BUDGET or wait for reset."
             )
 
+    def _get_model_pool(self) -> List[str]:
+        """
+        Get the model pool for fallback strategy.
+        
+        Returns a list of models in priority order:
+        1. Primary model
+        2. Fallback models (if configured)
+        """
+        return [self.model] + self.fallback_models
+
     def generate_content(
         self,
         prompt: str,
@@ -152,7 +173,7 @@ class LLMClient:
         model_override: Optional[str] = None,
     ) -> str:
         """
-        Generate content using the configured LLM.
+        Generate content using the configured LLM with intelligent fallback.
 
         Args:
             prompt: The user prompt/message
@@ -170,7 +191,6 @@ class LLMClient:
         """
         self._check_daily_budget()
 
-        model = model_override or self.model
         messages = []
 
         if system_prompt:
@@ -191,30 +211,26 @@ class LLMClient:
         if response_format is not None:
             base_kwargs["response_format"] = response_format
 
-        last_exception = None
-
-        is_dynamic_gemini = model.lower() in ("gemini", "google")
-        gemini_pool = [
-            "gemini/gemini-3.1-flash-lite-preview",
-            "gemini/gemini-3-flash-preview",
-            "gemini/gemini-2.5-flash",
-            "gemini/gemini-2.5-flash-lite",
-        ]
+        # Get model pool (primary + fallbacks)
+        model_pool = [model_override] if model_override else self._get_model_pool()
         pool_index = 0
         
-        # Ensure we retry enough times to try all models in the pool if dynamic
-        max_attempts = max(self.max_retries + 1, len(gemini_pool)) if is_dynamic_gemini else self.max_retries + 1
+        # Calculate max attempts to cover all models in pool with retries
+        max_attempts = len(model_pool) + self.max_retries
+
+        last_exception = None
 
         for attempt in range(max_attempts):
             try:
                 # Rate limiting
                 self.rate_limiter.acquire()
 
-                # Fixed inter-request delay
+                # Fixed inter-request delay (only on first attempt)
                 if self.request_delay > 0 and attempt == 0:
                     time.sleep(self.request_delay)
                     
-                current_model = gemini_pool[pool_index % len(gemini_pool)] if is_dynamic_gemini else model
+                # Get current model from pool
+                current_model = model_pool[pool_index % len(model_pool)]
                 kwargs = base_kwargs.copy()
                 kwargs["model"] = current_model
 
@@ -227,6 +243,7 @@ class LLMClient:
                 # Extract text from response
                 content = response.choices[0].message.content
                 if content:
+                    logger.info(f"LLM request successful using model: {current_model}")
                     return content.strip()
                 else:
                     logger.warning("LLM returned empty content")
@@ -242,37 +259,50 @@ class LLMClient:
                     "quota", "too many requests", "retry"
                 ])
 
-                if is_rate_limit and attempt < max_attempts - 1:
-                    if is_dynamic_gemini:
-                        pool_index += 1
-                        delay = random.uniform(1, 4) # Short delay when switching models
+                current_model = model_pool[pool_index % len(model_pool)]
+
+                if attempt < max_attempts - 1:
+                    if is_rate_limit:
+                        # Try next model in fallback pool
+                        next_model_index = (pool_index + 1) % len(model_pool)
+                        next_model = model_pool[next_model_index]
+                        
+                        delay = random.uniform(1, 4) if next_model_index != 0 else random.uniform(2, 8)
                         logger.warning(
-                            f"Rate limit hit for {current_model}. Switching to next pool model... "
+                            f"Rate limit/quota hit for {current_model}. "
+                            f"Falling back to {next_model}... "
                             f"(attempt {attempt + 1}/{max_attempts}). Retrying in {delay:.1f}s. Error: {e}"
                         )
+                        pool_index = next_model_index
                     else:
+                        # Non-rate-limit error — try next model in fallback pool
+                        next_model_index = (pool_index + 1) % len(model_pool)
+                        next_model = model_pool[next_model_index]
+                        
                         # Exponential backoff with jitter
                         delay = self.retry_base_delay * (2 ** attempt) + random.uniform(0, 5)
                         logger.warning(
-                            f"Rate limit hit (attempt {attempt + 1}/{max_attempts}). "
-                            f"Retrying in {delay:.1f}s... Error: {e}"
+                            f"LLM API error on {current_model} (attempt {attempt + 1}/{max_attempts}). "
+                            f"Falling back to {next_model}. Retrying in {delay:.1f}s... Error: {e}"
                         )
+                        pool_index = next_model_index
+                    
                     time.sleep(delay)
                     continue
-                elif not is_rate_limit:
-                    # Non-rate-limit error — don't retry
-                    logger.error(f"LLM API error (non-retryable) on model {current_model if 'current_model' in locals() else model}: {e}")
-                    raise
 
-        # All retries exhausted
-        failed_model = current_model if 'current_model' in locals() else model
-        logger.error(f"All {max_attempts} attempts failed for model {failed_model}")
+        # All retries exhausted with all models
+        failed_model = model_pool[pool_index % len(model_pool)]
+        logger.error(
+            f"All {max_attempts} attempts exhausted across models {model_pool}. "
+            f"Last failed model: {failed_model}. Last error: {last_exception}"
+        )
         raise last_exception
 
 
 def _create_client(
     model: str,
     api_key: Optional[str] = None,
+    fallback_models: Optional[List[str]] = None,
 ) -> LLMClient:
     """Create an LLMClient instance with config-based defaults."""
     return LLMClient(
@@ -283,13 +313,16 @@ def _create_client(
         retry_base_delay=config.LLM_RETRY_BASE_DELAY,
         daily_budget=config.LLM_DAILY_REQUEST_BUDGET,
         request_delay=config.LLM_REQUEST_DELAY_SECONDS,
+        fallback_models=fallback_models or config.LLM_FALLBACK_MODELS,
     )
 
 
 # --- Global Client Instances ---
 
 # Primary client (used by score_jobs, resume_parser, custom_resume_generator)
+# Uses configured fallback strategy: Gemini → OpenAI → Groq
 primary_client = _create_client(
     model=config.LLM_MODEL,
     api_key=config.LLM_API_KEY,
+    fallback_models=config.LLM_FALLBACK_MODELS,
 )
